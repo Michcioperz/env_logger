@@ -348,6 +348,13 @@ pub struct Logger {
     writer: Writer,
     filter: Filter,
     format: FormatFn,
+    cycle: std::sync::Arc<std::sync::Mutex<Option<(usize, CycleDirection)>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CycleDirection {
+    Tick,
+    Tock,
 }
 
 /// `Builder` acts as builder for initializing a `Logger`.
@@ -828,6 +835,7 @@ impl Builder {
             writer: self.writer.build(),
             filter: self.filter.build(),
             format: self.format.build(),
+            cycle: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -905,6 +913,42 @@ impl Log for Logger {
     }
 
     fn log(&self, record: &Record) {
+        #[allow(warnings)]
+        if record.target() == "cmemu_lib::component::quartz" && !self.matches(record) {
+            #[derive(Default)]
+            struct CycleCapture {
+                dir: Option<CycleDirection>,
+                cycle: Option<usize>,
+            }
+            use std::io::Write;
+            impl std::fmt::Write for CycleCapture {
+                fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                    match s {
+                        "================================ TICK: " => {
+                            self.dir = Some(CycleDirection::Tick);
+                            Ok(())
+                        }
+                        "================================ TOCK: " => {
+                            self.dir = Some(CycleDirection::Tock);
+                            Ok(())
+                        }
+                        s if s.chars().all(|c| char::is_digit(c, 10)) => {
+                            if let Ok(cycle) = s.parse() {
+                                self.cycle = Some(cycle);
+                            }
+                            Ok(())
+                        }
+                        " ================================" => Ok(()),
+                        _ => Ok(()),
+                    }
+                }
+            }
+            let mut uwu = CycleCapture::default();
+            std::fmt::write(&mut uwu, *record.args()).unwrap();
+            if let Some((dir, cycle)) = uwu.dir.zip(uwu.cycle) {
+                *self.cycle.lock().unwrap() = Some((cycle, dir));
+            }
+        }
         if self.matches(record) {
             // Log records are written to a thread-local buffer before being printed
             // to the terminal. We clear these buffers afterwards, but they aren't shrunk
@@ -919,7 +963,21 @@ impl Log for Logger {
                 static FORMATTER: RefCell<Option<Formatter>> = RefCell::new(None);
             }
 
+            let cycle_info = self.cycle.lock().unwrap().take();
+
             let print = |formatter: &mut Formatter, record: &Record| {
+                if let Some((cycle, dir)) = cycle_info {
+                    let _ = (self.format)(
+                        formatter,
+                        &log::Record::builder()
+                            .args(format_args!("{dir:?} {cycle}"))
+                            .target("cmemu_lib::component::quartz")
+                            .level(log::Level::Trace)
+                            .build(),
+                    )
+                    .and_then(|_| formatter.print(&self.writer));
+                    formatter.clear();
+                }
                 let _ =
                     (self.format)(formatter, record).and_then(|_| formatter.print(&self.writer));
 
